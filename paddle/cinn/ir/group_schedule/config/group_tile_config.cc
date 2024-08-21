@@ -99,7 +99,7 @@ std::shared_ptr<ScheduleConfig::BaseInfo> InitBasicInfo(
   std::set<int64_t> reduce_dim_loc;
   for (int64_t dim : group_info->reduce_axis) {
     if (dim < 0) {
-      dim += base_info->data_rank;
+      dim += base_info->data_space.size();
     }
     base_info->reduce_axis.push_back(dim);
     reduce_dim_loc.insert(dim);
@@ -107,7 +107,7 @@ std::shared_ptr<ScheduleConfig::BaseInfo> InitBasicInfo(
 
   base_info->spatial_numel = 1;
   base_info->reduce_numel = 1;
-  for (int64_t i = 0; i < base_info->data_rank; ++i) {
+  for (int64_t i = 0; i < base_info->data_space.size(); ++i) {
     if (reduce_dim_loc.count(i)) {
       if (group_info->loop_ranges[i] == -1)
         base_info->has_dynamic_reduce = true;
@@ -119,7 +119,7 @@ std::shared_ptr<ScheduleConfig::BaseInfo> InitBasicInfo(
     }
   }
   base_info->is_reduce_all =
-      (base_info->reduce_axis.size() == base_info->data_rank);
+      (base_info->reduce_axis.size() == base_info->data_space.size());
 
   for (int64_t i = 0; i < group_info->loop_ranges.size(); ++i) {
     if (group_info->loop_ranges[i] == 1) continue;
