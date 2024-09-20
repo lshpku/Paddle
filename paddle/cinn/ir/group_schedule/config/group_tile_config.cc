@@ -93,7 +93,7 @@ std::shared_ptr<ScheduleConfig::BaseInfo> InitBasicInfo(
     const std::shared_ptr<FusionGroupInfo>& group_info) {
   std::shared_ptr<ScheduleConfig::BaseInfo> base_info =
       std::make_shared<ScheduleConfig::BaseInfo>();
-  base_info->data_rank = group_info->loop_ranges.size();
+  base_info->data_space = group_info->loop_ranges;
   base_info->loop_strides = group_info->loop_strides;
 
   std::set<int64_t> reduce_dim_loc;
@@ -118,8 +118,6 @@ std::shared_ptr<ScheduleConfig::BaseInfo> InitBasicInfo(
       base_info->spatial_numel *= group_info->loop_ranges[i];
     }
   }
-  base_info->is_reduce_all =
-      (base_info->reduce_axis.size() == base_info->data_space.size());
 
   for (int64_t i = 0; i < group_info->loop_ranges.size(); ++i) {
     if (group_info->loop_ranges[i] == 1) continue;

@@ -692,6 +692,7 @@ EXPAND_REDUCE_FP16_MACRO(CINN_PARTIAL_BLOCK_REDUCE_INTERNAL_SHM_MACRO)
 
 #undef CINN_PARTIAL_BLOCK_REDUCE_INTERNAL_SHM_IMPL
 #undef CINN_PARTIAL_BLOCK_REDUCE_INTERNAL_SHM_MACRO
+
 #define CINN_INTERVAL_REDUCE_INTERNAL_SHM_IMPL(REDUCE_TYPE, value)               \
   int tid = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x; \
   shm[tid] = value;                                                              \

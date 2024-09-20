@@ -39,7 +39,6 @@ struct ScheduleConfig {
     int64_t spatial_numel;
     bool has_dynamic_spatial{false};
     bool has_dynamic_reduce{false};
-    bool is_reduce_all{false};
     IterSpaceType iter_space_type;
   };
 

@@ -25,31 +25,15 @@ namespace ir {
 
 using cinn::ir::analyzer::IsReductionSBlock;
 
-bool UseContinuousDataTile(const ScheduleConfig& config) {
-  if (config.base_info->reduce_axis.empty()) {
-    return true;
-  }
-  int64_t min_stride = INT_MAX;
-  int64_t min_reduce_stride = INT_MAX;
-  int64_t last_axis = 0;
-  int64_t last_reduce_axis = 0;
-  for (size_t i = 0; i < config.base_info->loop_strides.size(); i++) {
-    if (config.base_info->loop_strides[i] < min_stride &&
-        config.base_info->loop_strides[i] != 0) {
-      min_stride = config.base_info->loop_strides[i];
-      last_axis = i;
-    }
-  }
-  for (int64_t axis : config.base_info->reduce_axis) {
-    if (config.base_info->loop_strides[axis] < min_reduce_stride) {
-      min_reduce_stride = config.base_info->loop_strides[axis];
-      last_reduce_axis = axis;
-    }
-  }
-  return last_axis == last_reduce_axis;
-}
-
 class TileFirstGeneralTactic final : public ScheduleTactic {
+ private:
+  enum ApplyMethod {
+    UNDEFINED,
+    CONTINUOUS,
+    DISCRETE,
+    INTERVAL,
+  };
+
  public:
   void Init(ScheduleContext* context) override;
 
@@ -62,11 +46,10 @@ class TileFirstGeneralTactic final : public ScheduleTactic {
   void ApplyDiscreteReduce(ir::IRSchedule* sch, const std::string& block_id);
   void ApplyIntervalReduce(ir::IRSchedule* sch, const std::string& block_id);
 
-  void AlignToReduceInput(ir::IRSchedule* sch, const std::string& block_id);
-  void MergeFlattenAxis(ir::IRSchedule* sch, const std::string& block_id);
-  void MergeDiscreteFlattenAxis(ir::IRSchedule* sch,
-                                const std::string& block_id);
-  void MergeReduceAxis(ir::IRSchedule* sch, const std::string& block_id);
+  void ReorderLoopsByLoopStrides(ir::IRSchedule* sch,
+                                 const std::string& block_id);
+  void FuseSpatialAxis(ir::IRSchedule* sch, const std::string& block_id);
+  void FuseReduceAxis(ir::IRSchedule* sch, const std::string& block_id);
   void SplitSptialInner(ir::IRSchedule* sch, const std::string& block_id);
   void SplitReduceInner(ir::IRSchedule* sch, const std::string& block_id);
   void VariableTypeAssignment(ir::IRSchedule* sch, const std::string& block_id);
@@ -77,116 +60,97 @@ class TileFirstGeneralTactic final : public ScheduleTactic {
 
  private:
   ScheduleContext* context_;
-  std::vector<int32_t> vec_spatial_axis_first_;
-  std::vector<int32_t> vec_spatial_axis_last_;
-  std::vector<int32_t> vec_flatten_axis_;
-  std::vector<int32_t> vec_reduce_axis_;
+  ApplyMethod apply_method_;
+  std::vector<int64_t> loop_permutation_;
+  int64_t innermost_reduce_axis_count_;
+  int64_t innermost_reduce_data_space_;
   std::unordered_map<std::string, std::string> map_rf_block_;
-
-  std::vector<bool> vec_is_reduce_;
-  std::vector<int64_t> loop_perm_;
-  int64_t num_lower_reduce_axes_;
-  int64_t lower_reduce_extend_;  // -1 means dynamic shape
 };
 
 void TileFirstGeneralTactic::Init(ScheduleContext* context) {
   context_ = context;
+  map_rf_block_.clear();
+  auto& loop_strides = context_->config.base_info->loop_strides;
+  auto& reduce_axis = context_->config.base_info->reduce_axis;
 
-  const size_t num_loops = context_->config.base_info->data_space.size();
-  vec_is_reduce_.assign(num_loops, false);
-  for (int64_t axis : context_->config.base_info->reduce_axis) {
-    vec_is_reduce_[axis] = true;
-  }
-
-  const auto& loop_strides = context_->config.base_info->loop_strides;
-  loop_perm_.clear();
+  // We use loop_permutation_ to reorder the loops. Loop with a larger stride
+  // will be placed outer, and vice versa.
+  loop_permutation_.clear();
   if (!loop_strides.empty()) {
-    loop_perm_.resize(num_loops);
-    std::iota(loop_perm_.begin(), loop_perm_.end(), 0);
-    std::sort(loop_perm_.begin(), loop_perm_.end(), [&](int64_t a, int64_t b) {
-      return loop_strides[a] > loop_strides[b];
-    });
+    loop_permutation_.resize(loop_strides.size());
+    std::iota(loop_permutation_.begin(), loop_permutation_.end(), 0);
+    std::sort(loop_permutation_.begin(),
+              loop_permutation_.end(),
+              [&](int64_t a, int64_t b) {
+                return loop_strides[a] > loop_strides[b];
+              });
   }
 
-  num_lower_reduce_axes_ = 0;
-  lower_reduce_extend_ = 1;
-  for (int i = loop_perm_.size() - 1; i >= 0; i--) {
-    int axis = loop_perm_[i];
+  // Find the innermost reduce axes (must be continuous) and their data space.
+  innermost_reduce_axis_count_ = 0;
+  innermost_reduce_data_space_ = 1;
+  for (int i = loop_permutation_.size() - 1; i >= 0; i--) {
+    int64_t axis = loop_permutation_[i];
     if (loop_strides[axis] == 0) {
       continue;
     }
-    if (!vec_is_reduce_[axis]) {
+    if (reduce_axis.find(axis) == reduce_axis.end()) {
       break;
     }
-    num_lower_reduce_axes_++;
+    ++innermost_reduce_axis_count_;
 
-    const int64_t data_space = context_->config.base_info->data_space[axis];
+    int64_t data_space = context_->config.base_info->data_space[axis];
     if (data_space == -1) {
-      lower_reduce_extend_ = -1;
-    } else if (lower_reduce_extend_ != -1) {
-      lower_reduce_extend_ =
-          std::max(data_space * loop_strides[axis], lower_reduce_extend_);
+      innermost_reduce_data_space_ = -1;
+    } else if (innermost_reduce_data_space_ != -1) {
+      innermost_reduce_data_space_ = std::max(data_space * loop_strides[axis],
+                                              innermost_reduce_data_space_);
     }
   }
 
-  VLOG(4) << "loop_perm: " << utils::Join(loop_perm_, ", ");
-  VLOG(4) << "num_lower_reduce_axes: " << num_lower_reduce_axes_;
-  VLOG(4) << "lower_reduce_extend: " << lower_reduce_extend_;
-
-  // reduce axis have be re-order to last
-  vec_flatten_axis_.clear();
-  vec_reduce_axis_.clear();
-  int32_t reduce_start_idx =
-      num_loops - context_->config.base_info->reduce_axis.size();
-  for (int32_t i = 0; i < num_loops; ++i) {
-    if (i >= reduce_start_idx) {
-      vec_reduce_axis_.push_back(i);
+  if (innermost_reduce_axis_count_ > 0) {
+    if (innermost_reduce_data_space_ <= 16 &&
+        innermost_reduce_data_space_ != -1) {
+      apply_method_ = INTERVAL;
     } else {
-      vec_flatten_axis_.push_back(i);
+      apply_method_ = CONTINUOUS;
+    }
+  } else {
+    if (context_->config.base_info->reduce_axis.empty()) {
+      apply_method_ = CONTINUOUS;
+    } else {
+      apply_method_ = DISCRETE;
     }
   }
-  vec_spatial_axis_first_.clear();
-  vec_spatial_axis_last_.clear();
 
-  if (!context_->config.base_info->reduce_axis.empty()) {
-    int64_t first_reduce_axis = context_->config.base_info->reduce_axis.front();
-    for (auto axis : context_->config.base_info->reduce_axis) {
-      if (context->config.base_info->loop_strides[axis] >
-          context->config.base_info->loop_strides[first_reduce_axis]) {
-        first_reduce_axis = axis;
-      }
-    }
-    for (int32_t i = 0; i < reduce_start_idx; ++i) {
-      if (i < first_reduce_axis) {
-        vec_spatial_axis_first_.push_back(i);
-      } else {
-        vec_spatial_axis_last_.push_back(i);
-      }
-    }
-  }
+  VLOG(4) << "After TileFirstGeneralTactic Init:\n"
+          << "loop_permutation: " << utils::Join(loop_permutation_, ", ")
+          << "innermost_reduce_axis_count: " << innermost_reduce_axis_count_
+          << "innermost_reduce_data_space: " << innermost_reduce_data_space_
+          << "apply_method: " << apply_method_;
 }
 
 void TileFirstGeneralTactic::Apply(ir::IRSchedule* sch,
                                    const std::string& block_id) {
   if (ir::IsReduceInitTensorName(block_id)) return;
 
-  AlignToReduceInput(sch, block_id);
-  VLOG(4) << "After AlignToReduceInput on block: [" << block_id
+  ReorderLoopsByLoopStrides(sch, block_id);
+  VLOG(4) << "After ReorderLoopsByLoopStrides on block: [" << block_id
           << "], loop nest:\n"
           << sch->GetLoops(block_id)[0];
 
-  if (num_lower_reduce_axes_) {
-    if (lower_reduce_extend_ <= 16 && lower_reduce_extend_ != -1) {
-      ApplyIntervalReduce(sch, block_id);
-    } else {
+  switch (apply_method_) {
+    case CONTINUOUS:
       ApplyContinuousReduce(sch, block_id);
-    }
-  } else {
-    if (vec_reduce_axis_.empty()) {
-      ApplyContinuousReduce(sch, block_id);
-    } else {
+      break;
+    case DISCRETE:
       ApplyDiscreteReduce(sch, block_id);
-    }
+      break;
+    case INTERVAL:
+      ApplyIntervalReduce(sch, block_id);
+      break;
+    default:
+      PADDLE_THROW("The apply_method_ is invalid.")
   }
 }
 
@@ -204,13 +168,12 @@ void TileFirstGeneralTactic::ApplyContinuousReduce(
   VLOG(4) << "ApplyContinuousDataTile vec_reduce_axis: "
           << utils::Join(vec_reduce_axis_, ", ");
 
-  MergeReduceAxis(sch, block_id);
-  VLOG(4) << "After MergeReduceAxis on block: [" << block_id
-          << "], loop nest:\n"
+  FuseReduceAxis(sch, block_id);
+  VLOG(4) << "After FuseReduceAxis on block: [" << block_id << "], loop nest:\n"
           << sch->GetLoops(block_id)[0];
 
-  MergeFlattenAxis(sch, block_id);
-  VLOG(4) << "After MergeFlattenAxis on block: [" << block_id
+  FuseSpatialAxis(sch, block_id);
+  VLOG(4) << "After FuseSpatialAxis on block: [" << block_id
           << "], loop nest:\n"
           << sch->GetLoops(block_id)[0];
 
@@ -291,9 +254,8 @@ void TileFirstGeneralTactic::ApplyContinuousReduce(
 
 void TileFirstGeneralTactic::ApplyDiscreteReduce(ir::IRSchedule* sch,
                                                  const std::string& block_id) {
-  MergeReduceAxis(sch, block_id);
-  VLOG(4) << "After MergeReduceAxis on block: [" << block_id
-          << "], loop nest:\n"
+  FuseReduceAxis(sch, block_id);
+  VLOG(4) << "After FuseReduceAxis on block: [" << block_id << "], loop nest:\n"
           << sch->GetLoops(block_id)[0];
   MergeDiscreteFlattenAxis(sch, block_id);
   VLOG(4) << "After MergeDiscreteFlattenAxis on block: [" << block_id
@@ -323,18 +285,17 @@ void TileFirstGeneralTactic::ApplyIntervalReduce(ir::IRSchedule* sch,
                             context_->config.tile_config.tree_reduce_num;
   const int64_t sp_loop = context_->config.tile_config.spatial_inner_num;
   const int64_t rd_thread = context_->config.tile_config.tree_reduce_num;
-  const int64_t tx = lower_reduce_extend_;
+  const int64_t tx = innermost_reduce_data_space_;
   const int64_t ty = std::max(32 / tx, sp_thread);
   const int64_t tz = sp_thread * rd_thread / (tx * ty);
   VLOG(4) << "ApplyIntervalReduce tx=" << tx << " ty=" << ty << " tz=" << tz;
 
-  MergeReduceAxis(sch, block_id);
-  VLOG(4) << "After MergeReduceAxis on block: [" << block_id
-          << "], loop nest:\n"
+  FuseReduceAxis(sch, block_id);
+  VLOG(4) << "After FuseReduceAxis on block: [" << block_id << "], loop nest:\n"
           << sch->GetLoops(block_id)[0];
 
-  MergeFlattenAxis(sch, block_id);
-  VLOG(4) << "After MergeFlattenAxis on block: [" << block_id
+  FuseSpatialAxis(sch, block_id);
+  VLOG(4) << "After FuseSpatialAxis on block: [" << block_id
           << "], loop nest:\n"
           << sch->GetLoops(block_id)[0];
 
@@ -364,12 +325,16 @@ void TileFirstGeneralTactic::ApplyIntervalReduce(ir::IRSchedule* sch,
     loops = sch->GetLoops(block_id);
     sch->Reorder({loops[current_reduce_axis + 1], loops[current_reduce_axis]});
 
-    if (IsReduceBlock(context_->config, block_id)) {
+    if (IsReductionSBlock(sch->GetBlock(block_id))) {
       loops = sch->GetLoops(block_id);
-      sch->FactorizeReduction(loops[current_reduce_axis],
-                              /* rf_axis = */ 0,
-                              /* with_write_back_block_init = */ false);
-      loops = sch->GetLoops(block_id + "_rf");
+      ir::Expr rf_tensor =
+          sch->FactorizeReduction(loops[current_reduce_axis],
+                                  /* rf_axis = */ 0,
+                                  /* with_write_back_block_init = */ false);
+
+      std::string rf_block_id = rf_tensor.as_tensor_ref()->name;
+      map_rf_block_[block_id] = rf_block_id;
+      loops = sch->GetLoops(rf_block_id);
       sch->Split(loops[current_reduce_axis], {tz, tx});
     }
 
@@ -389,9 +354,8 @@ void TileFirstGeneralTactic::ApplyIntervalReduce(ir::IRSchedule* sch,
     sch->Bind(loops[current_reduce_axis + 1], "threadIdx.x");
   };
   DoBind(sch->GetLoops(block_id));
-  if (IsReduceBlock(context_->config, block_id) &&
-      sch->HasBlock(block_id + "_rf")) {
-    DoBind(sch->GetLoops(block_id + "_rf"));
+  if (map_rf_block_.count(block_id) > 0) {
+    DoBind(sch->GetLoops(map_rf_block_[block_id]));
   }
   VLOG(4) << "After BindCudaInfo on block: [" << block_id << "], loop nest:\n"
           << sch->GetLoops(block_id)[0];
@@ -400,48 +364,37 @@ void TileFirstGeneralTactic::ApplyIntervalReduce(ir::IRSchedule* sch,
   SetIntervalReduceType(sch, block_id);
 }
 
-void TileFirstGeneralTactic::AlignToReduceInput(ir::IRSchedule* sch,
-                                                const std::string& block_id) {
-  const auto& loop_strides = context_->config.base_info->loop_strides;
-  if (loop_strides.empty()) {
+void TileFirstGeneralTactic::ReorderLoopsByLoopStrides(
+    ir::IRSchedule* sch, const std::string& block_id) {
+  if (loop_permutation_.empty()) {
     return;
   }
+  auto& loop_strides = context_->config.base_info->loop_strides;
+  auto& reduce_axis = context_->config.base_info->reduce_axis;
 
-  // Reorder S/R loops seperately, otherwise reduce_init will be de-inlined.
+  // Reorder spatial and reduce loops seperately.
   std::vector<ir::Expr> loops = sch->GetLoops(block_id);
-  std::vector<Expr> sp_loops, rd_loops;
-  for (auto i : loop_perm_) {
-    if (vec_is_reduce_[i]) {
-      rd_loops.push_back(loops[i]);
-    } else if (loop_strides[i] != 0) {
-      sp_loops.push_back(loops[i]);
+  std::vector<ir::Expr> sp_loops, rd_loops;
+  for (auto axis : loop_permutation_) {
+    if (reduce_axis.find(axis) != reduce_axis.end()) {
+      rd_loops.push_back(loops[axis]);
+    } else if (loop_strides[axis] != 0) {
+      sp_loops.push_back(loops[axis]);
     }
   }
   sch->Reorder(sp_loops);
   sch->Reorder(rd_loops);
 }
 
-void TileFirstGeneralTactic::MergeFlattenAxis(ir::IRSchedule* sch,
-                                              const std::string& block_id) {
+void TileFirstGeneralTactic::FuseSpatialAxis(ir::IRSchedule* sch,
+                                             const std::string& block_id) {
   if (vec_flatten_axis_.size() >= 2) {
     sch->Fuse(block_id, vec_flatten_axis_);
   }
 }
 
-void TileFirstGeneralTactic::MergeDiscreteFlattenAxis(
-    ir::IRSchedule* sch, const std::string& block_id) {
-  // Note: We need to fuse loops from bottom to top,
-  // because the loop index will be changed when the upper loops fused.
-  if (vec_spatial_axis_last_.size() >= 2) {
-    sch->Fuse(block_id, vec_spatial_axis_last_);
-  }
-  if (vec_spatial_axis_first_.size() >= 2) {
-    sch->Fuse(block_id, vec_spatial_axis_first_);
-  }
-}
-
-void TileFirstGeneralTactic::MergeReduceAxis(ir::IRSchedule* sch,
-                                             const std::string& block_id) {
+void TileFirstGeneralTactic::FuseReduceAxis(ir::IRSchedule* sch,
+                                            const std::string& block_id) {
   std::vector<ir::Expr> loops = sch->GetLoops(block_id);
   int32_t max_loop_idx = 0;
   for (int32_t idx : vec_reduce_axis_) {
@@ -533,7 +486,7 @@ void TileFirstGeneralTactic::SetDiscreteReduceType(
 
 void TileFirstGeneralTactic::SetIntervalReduceType(
     ir::IRSchedule* sch, const std::string& block_id) {
-  if (IsReduceBlock(context_->config, block_id)) {
+  if (IsReductionSBlock(sch->GetBlock(block_id))) {
     auto block = sch->GetBlock(block_id)
                      .As<ir::ScheduleBlockRealize>()
                      ->schedule_block.As<ir::ScheduleBlock>();
